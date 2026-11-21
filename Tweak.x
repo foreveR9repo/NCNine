@@ -20,7 +20,22 @@
 - (void)_setSecure:(BOOL)secure;
 @end
 
-#define NCLOG(fmt, ...) NSLog(@"[NCNine] " fmt, ##__VA_ARGS__)
+// Log fichier : /var/mobile/Library/Logs/NCNine.log (lisible avec Filza)
+static void NCLogString(NSString *msg) {
+    NSLog(@"[NCNine] %@", msg);
+    static dispatch_queue_t q; static dispatch_once_t t;
+    dispatch_once(&t, ^{ q = dispatch_queue_create("ncnine.log", DISPATCH_QUEUE_SERIAL); });
+    NSString *line = [NSString stringWithFormat:@"%@ %@\n", [NSDate date], msg];
+    dispatch_async(q, ^{
+        NSString *path = @"/var/mobile/Library/Logs/NCNine.log";
+        NSDictionary *a = [[NSFileManager defaultManager] attributesOfItemAtPath:path error:nil];
+        if ([a fileSize] > 200 * 1024) [[NSFileManager defaultManager] removeItemAtPath:path error:nil];
+        NSFileHandle *h = [NSFileHandle fileHandleForWritingAtPath:path];
+        if (!h) { [line writeToFile:path atomically:NO encoding:NSUTF8StringEncoding error:nil]; return; }
+        [h seekToEndOfFile]; [h writeData:[line dataUsingEncoding:NSUTF8StringEncoding]]; [h closeFile];
+    });
+}
+#define NCLOG(fmt, ...) NCLogString([NSString stringWithFormat:fmt, ##__VA_ARGS__])
 
 // ---------------------------------------------------------------------------
 // Fenêtre + contrôleur
@@ -90,7 +105,38 @@ static BOOL NCShouldIntercept(void) {
 // Hooks
 // ---------------------------------------------------------------------------
 
-// Couche 1 (préférée) : le geste de swipe-down lui-même.
+
+// Couche 0 (la plus fiable) : on intercepte l'état du reconnaisseur de geste
+// du CoverSheet lui-même. Ne dépend d'aucun nom de méthode du CoverSheet :
+// seules les classes SBCoverSheetScreenEdgePanGestureRecognizer /
+// SBCoverSheetPresentationGestureRecognizer (présentes dans les headers iOS 16.3)
+// sont ciblées. Si on est déverrouillé, on fait ÉCHOUER le geste natif
+// (Possible -> Failed, transition légale) et on affiche notre NC.
+%hook UIGestureRecognizer
+- (void)setState:(UIGestureRecognizerState)state {
+    if (state == UIGestureRecognizerStateBegan) {
+        NSString *cn = NSStringFromClass(object_getClass(self));
+        BOOL isCover = [cn hasPrefix:@"SBCoverSheet"];
+        if (isCover || [cn hasPrefix:@"SB"] || [cn hasPrefix:@"CS"]) {
+            static NSMutableSet *seen; static dispatch_once_t t;
+            dispatch_once(&t, ^{ seen = [NSMutableSet new]; });
+            if (isCover || ![seen containsObject:cn]) {
+                [seen addObject:cn];
+                NCLOG(@"geste Began: %@ unlocked=%d intercept=%d", cn, NCIsUnlocked(), NCShouldIntercept());
+            }
+        }
+        if (isCover && ([cn containsString:@"ScreenEdgePan"] || [cn containsString:@"PresentationGesture"]) && NCShouldIntercept()) {
+            NCLOG(@"swipe-down déverrouillé: geste %@ annulé -> NC iOS 9", cn);
+            %orig(UIGestureRecognizerStateFailed);
+            dispatch_async(dispatch_get_main_queue(), ^{ NCShow(); });
+            return;
+        }
+    }
+    %orig;
+}
+%end
+
+// Couche 1 : le geste de swipe-down lui-même.
 // Le delegate des gestes système du CoverSheet décide si le geste démarre.
 // Si on est déverrouillé : on affiche notre NC et on refuse le geste natif,
 // donc le rideau natif n'apparaît jamais, même pas à moitié.
@@ -162,5 +208,11 @@ static void NCLockEvent(CFNotificationCenterRef c, void *o, CFStringRef n, const
         if (UIDeviceOrientationIsPortrait(o) || UIDeviceOrientationIsLandscape(o)) NCHide(NO);
     }];
     [UIDevice.currentDevice beginGeneratingDeviceOrientationNotifications];
-    NCLOG(@"chargé");
+    NCLOG(@"chargé. iOS %@", UIDevice.currentDevice.systemVersion);
+    for (NSString *c in @[@"SBLockScreenManager", @"SBCoverSheetPresentationManager", @"SBCoverSheetSystemGesturesDelegate",
+                          @"SBCoverSheetScreenEdgePanGestureRecognizer", @"SBCoverSheetPresentationGestureRecognizer",
+                          @"NCNotificationDispatcher", @"SBHomeHardwareButtonActions"])
+        NCLOG(@"classe %@ : %@", c, NSClassFromString(c) ? @"présente" : @"ABSENTE");
+    id lm = [NSClassFromString(@"SBLockScreenManager") sharedInstance];
+    NCLOG(@"isUILocked disponible : %d", [lm respondsToSelector:@selector(isUILocked)]);
 }
