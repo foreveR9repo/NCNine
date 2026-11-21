@@ -1,0 +1,9 @@
+Package: com.example.ncnine
+Name: NCNine
+Version: 0.1.0
+Architecture: iphoneos-arm64
+Description: Notification Center style iOS 9 on swipe-down while unlocked
+Maintainer: you
+Author: you
+Section: Tweaks
+Depends: mobilesubstrate
