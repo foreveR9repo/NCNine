@@ -1,9 +1,10 @@
 #import <UIKit/UIKit.h>
+#import <notify.h>
 #import "NCI9Store.h"
 #import "NCI9ViewController.h"
 
 // ---------------------------------------------------------------------------
-// Déclarations minimales (classes privées SpringBoard iOS 15-17)
+// Déclarations minimales (classes privées SpringBoard)
 // ---------------------------------------------------------------------------
 @interface SBLockScreenManager : NSObject
 + (instancetype)sharedInstance;
@@ -15,11 +16,11 @@
 - (BOOL)isPresented;
 @end
 
-@interface UIWindow (NCI9Private)
+@interface UIWindow (NCNinePrivate)
 - (void)_setSecure:(BOOL)secure;
 @end
 
-#define NCI9LOG(fmt, ...) NSLog(@"[NCNine] " fmt, ##__VA_ARGS__)
+#define NCLOG(fmt, ...) NSLog(@"[NCNine] " fmt, ##__VA_ARGS__)
 
 // ---------------------------------------------------------------------------
 // Fenêtre + contrôleur
@@ -27,26 +28,29 @@
 static UIWindow *gWindow;
 static NCI9ViewController *gVC;
 static BOOL gVisible;
-static CFAbsoluteTime gLastLockRequest;   // anti-confusion avec le bouton latéral / verrouillage
+static CFAbsoluteTime gLastLockEvent;   // dernier changement d'état verrouillage / écran
 
-static BOOL NCI9IsUnlocked(void) {
-    SBLockScreenManager *m = [NSClassFromString(@"SBLockScreenManager") sharedInstance];
+static BOOL NCIsUnlocked(void) {
+    id m = [NSClassFromString(@"SBLockScreenManager") sharedInstance];
     if (![m respondsToSelector:@selector(isUILocked)]) return NO;   // doute => on ne touche à rien
-    return ![m isUILocked];
+    return ![(SBLockScreenManager *)m isUILocked];
 }
 
-static void NCI9Hide(BOOL animated) {
+static void NCHide(BOOL animated) {
     if (!gVisible) return;
     gVisible = NO;
     UIWindow *w = gWindow;
-    void (^done)(BOOL) = ^(BOOL f) { w.hidden = YES; if (gWindow == w) { gWindow = nil; gVC = nil; } };
+    void (^done)(BOOL) = ^(BOOL f) {
+        w.hidden = YES;
+        if (gWindow == w) { gWindow = nil; gVC = nil; }
+    };
     if (!animated) { done(YES); return; }
     [UIView animateWithDuration:.28 delay:0 options:UIViewAnimationOptionCurveEaseIn animations:^{
         w.transform = CGAffineTransformMakeTranslation(0, -w.bounds.size.height);
     } completion:done];
 }
 
-static void NCI9Show(void) {
+static void NCShow(void) {
     if (gVisible) return;
     gVisible = YES;
     CGRect b = UIScreen.mainScreen.bounds;
@@ -55,7 +59,7 @@ static void NCI9Show(void) {
     if ([gWindow respondsToSelector:@selector(_setSecure:)]) [gWindow _setSecure:YES];
     gWindow.backgroundColor = UIColor.clearColor;
     gVC = [NCI9ViewController new];
-    gVC.requestDismiss = ^{ NCI9Hide(YES); };
+    gVC.requestDismiss = ^{ NCHide(YES); };
     gWindow.rootViewController = gVC;
     gWindow.transform = CGAffineTransformMakeTranslation(0, -b.size.height);
     gWindow.hidden = NO;
@@ -68,39 +72,53 @@ static void NCI9Show(void) {
 // Décision : intercepter ou laisser le CoverSheet natif ?
 // On n'intercepte QUE si :
 //  - l'appareil est déverrouillé,
-//  - aucun verrouillage n'a été demandé dans la dernière seconde (bouton latéral),
-//  - le CoverSheet n'est pas déjà présenté.
+//  - aucun changement d'état verrouillage / écran dans la dernière seconde
+//    (bouton latéral, réveil, déverrouillage),
+//  - le CoverSheet n'est pas déjà présenté,
+//  - notre NC n'est pas déjà visible.
 // ---------------------------------------------------------------------------
-static BOOL NCI9ShouldIntercept(void) {
-    if (!NCI9IsUnlocked()) return NO;
-    if (CFAbsoluteTimeGetCurrent() - gLastLockRequest < 1.0) return NO;
-    SBCoverSheetPresentationManager *pm = [NSClassFromString(@"SBCoverSheetPresentationManager") sharedInstance];
-    if ([pm respondsToSelector:@selector(isPresented)] && [pm isPresented]) return NO;
+static BOOL NCShouldIntercept(void) {
+    if (gVisible) return NO;
+    if (!NCIsUnlocked()) return NO;
+    if (CFAbsoluteTimeGetCurrent() - gLastLockEvent < 1.0) return NO;
+    id pm = [NSClassFromString(@"SBCoverSheetPresentationManager") sharedInstance];
+    if ([pm respondsToSelector:@selector(isPresented)] && [(SBCoverSheetPresentationManager *)pm isPresented]) return NO;
     return YES;
 }
 
 // ---------------------------------------------------------------------------
 // Hooks
 // ---------------------------------------------------------------------------
-%hook SBLockScreenManager
-// Marque toute demande de verrouillage (bouton latéral, auto-lock) pour ne jamais l'intercepter.
-- (void)lockUIFromSource:(int)source withOptions:(id)options {
-    gLastLockRequest = CFAbsoluteTimeGetCurrent();
-    NCI9Hide(NO);
-    %orig;
+
+// Couche 1 (préférée) : le geste de swipe-down lui-même.
+// Le delegate des gestes système du CoverSheet décide si le geste démarre.
+// Si on est déverrouillé : on affiche notre NC et on refuse le geste natif,
+// donc le rideau natif n'apparaît jamais, même pas à moitié.
+%hook SBCoverSheetSystemGesturesDelegate
+- (BOOL)gestureRecognizerShouldBegin:(UIGestureRecognizer *)g {
+    BOOL r = %orig;
+    if (!r) return r;
+    NCLOG(@"gestureRecognizerShouldBegin: %@ state-unlocked=%d", NSStringFromClass(g.class), NCIsUnlocked());
+    if (![g isKindOfClass:UIPanGestureRecognizer.class]) return r;
+    if (!NCShouldIntercept()) return r;
+    CGPoint p = [g locationInView:g.view];
+    if (p.y > 150) return r;               // geste parti du haut de l'écran uniquement
+    NCLOG(@"swipe-down déverrouillé -> NC iOS 9 (geste bloqué)");
+    dispatch_async(dispatch_get_main_queue(), ^{ NCShow(); });
+    return NO;
 }
 %end
 
+// Couche 2 (filet de sécurité) : si le CoverSheet est tout de même présenté
+// alors qu'on est déverrouillé, on demande l'état « non présenté » au lieu de
+// bloquer l'appel : l'original gère lui-même sa complétion.
 %hook SBCoverSheetPresentationManager
-// ⚠ POINT À VALIDER sur ta version d'iOS (voir README) : c'est le point d'entrée
-// de la présentation du CoverSheet. Si la signature diffère, adapter ici.
 - (void)setCoverSheetPresented:(BOOL)presented animated:(BOOL)animated withCompletion:(id)completion {
-    if (presented && NCI9ShouldIntercept()) {
-        NCI9LOG(@"swipe-down déverrouillé intercepté -> NC iOS 9");
-        dispatch_async(dispatch_get_main_queue(), ^{ NCI9Show(); });
-        void (^c)(void) = completion;
-        if (c) c();           // on ne bloque pas l'appelant
-        return;               // pas de %orig => pas de CoverSheet
+    NCLOG(@"setCoverSheetPresented:%d unlocked=%d", presented, NCIsUnlocked());
+    if (presented && NCShouldIntercept()) {
+        dispatch_async(dispatch_get_main_queue(), ^{ NCShow(); });
+        %orig(NO, animated, completion);
+        return;
     }
     %orig;
 }
@@ -117,16 +135,32 @@ static BOOL NCI9ShouldIntercept(void) {
 // Bouton Home physique (SE 2020) : ferme le NC custom.
 %hook SBHomeHardwareButtonActions
 - (void)performSinglePressUpActions {
-    if (gVisible) { NCI9Hide(YES); return; }
+    if (gVisible) { NCHide(YES); return; }
     %orig;
 }
 %end
 
+// ---------------------------------------------------------------------------
+// Notifications Darwin : verrouillage / extinction / réveil de l'écran.
+// Remplace le hook de lockUIFromSource: (signature incertaine selon la version).
+// ---------------------------------------------------------------------------
+static void NCLockEvent(CFNotificationCenterRef c, void *o, CFStringRef n, const void *obj, CFDictionaryRef u) {
+    gLastLockEvent = CFAbsoluteTimeGetCurrent();
+    dispatch_async(dispatch_get_main_queue(), ^{ NCHide(NO); });
+}
+
 %ctor {
-    // Rotation : on referme plutôt que de gérer un layout paysage non reproduit.
+    CFNotificationCenterRef d = CFNotificationCenterGetDarwinNotifyCenter();
+    CFNotificationCenterAddObserver(d, NULL, NCLockEvent, CFSTR("com.apple.springboard.lockstate"), NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
+    CFNotificationCenterAddObserver(d, NULL, NCLockEvent, CFSTR("com.apple.springboard.hasBlankedScreen"), NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
+
+    // Rotation : on referme (layout paysage non reproduit). On ignore à plat / inconnu.
     [[NSNotificationCenter defaultCenter] addObserverForName:UIDeviceOrientationDidChangeNotification
                                                       object:nil queue:NSOperationQueue.mainQueue
-                                                  usingBlock:^(NSNotification *n) { NCI9Hide(NO); }];
+                                                  usingBlock:^(NSNotification *n) {
+        UIDeviceOrientation o = UIDevice.currentDevice.orientation;
+        if (UIDeviceOrientationIsPortrait(o) || UIDeviceOrientationIsLandscape(o)) NCHide(NO);
+    }];
     [UIDevice.currentDevice beginGeneratingDeviceOrientationNotifications];
-    NCI9LOG(@"chargé");
+    NCLOG(@"chargé");
 }

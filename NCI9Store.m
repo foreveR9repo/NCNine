@@ -43,6 +43,7 @@ NSString *NCI9L(NSString *key) {
     it.title      = SafeKVC(content, @"title") ?: @"";
     it.message    = SafeKVC(content, @"message") ?: @"";
     it.date       = SafeKVC(content, @"date") ?: [NSDate date];
+    if (it.title.length == 0 && it.message.length == 0) return;   // notification silencieuse
     dispatch_async(dispatch_get_main_queue(), ^{
         for (NCI9Item *o in self->_items)
             if ([o.identifier isEqual:it.identifier]) { [self->_items removeObject:o]; break; }

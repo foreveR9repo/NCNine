@@ -32,6 +32,17 @@ static UIImage *AppIcon(NSString *bid, CGFloat side) {
     }];
 }
 
+static UIImage *BatteryIcon(CGFloat side) {
+    UIGraphicsImageRenderer *r = [[UIGraphicsImageRenderer alloc] initWithSize:CGSizeMake(side, side)];
+    return [r imageWithActions:^(UIGraphicsImageRendererContext *c) {
+        CGRect rect = CGRectMake(0, 0, side, side);
+        [[UIColor colorWithRed:.3 green:.85 blue:.4 alpha:1] setFill];
+        [[UIBezierPath bezierPathWithRoundedRect:rect cornerRadius:side * 0.225] fill];
+        [UIColor.whiteColor setFill];
+        [[UIBezierPath bezierPathWithRoundedRect:CGRectMake(side*.2, side*.38, side*.6, side*.24) cornerRadius:2] fill];
+    }];
+}
+
 static NSString *Ago(NSDate *d) {
     NSTimeInterval s = -[d timeIntervalSinceNow];
     if (s < 60) return NCI9L(@"now");
@@ -89,6 +100,7 @@ static NSString *Ago(NSDate *d) {
     UIScrollView *_today; UITableView *_table; UILabel *_emptyL;
     UIButton *_handle; NSInteger _tab;
     NSArray<NSString *> *_bundles; NSDictionary<NSString *, NSArray<NCI9Item *> *> *_groups;
+    CGFloat _builtWidth;
 }
 
 - (void)viewDidLoad {
@@ -113,9 +125,7 @@ static NSString *Ago(NSDate *d) {
 
 // ---- Segment ----
 - (void)buildSegment {
-    CGFloat w = self.view.bounds.size.width - 2 * kSegX;
-    _segBox = [[UIView alloc] initWithFrame:CGRectMake(kSegX, kSegY, w, kSegH)];
-    _segBox.autoresizingMask = UIViewAutoresizingFlexibleWidth;
+    _segBox = [UIView new];
     _segBox.layer.cornerRadius = 4; _segBox.layer.borderWidth = 1; _segBox.clipsToBounds = YES;
     _segBox.layer.borderColor = [UIColor colorWithWhite:1 alpha:.4].CGColor;
     [self.view addSubview:_segBox];
@@ -123,8 +133,8 @@ static NSString *Ago(NSDate *d) {
     _selBG = [UIView new]; _selBG.backgroundColor = Tint(); [_segBox addSubview:_selBG];
     _btnToday  = [self segButton:NCI9L(@"today") tag:0];
     _btnNotifs = [self segButton:NCI9L(@"notifs") tag:1];
-    _rule = [[UIView alloc] initWithFrame:CGRectMake(0, kRuleY, self.view.bounds.size.width, 1 / UIScreen.mainScreen.scale)];
-    _rule.backgroundColor = RuleColor(); _rule.autoresizingMask = UIViewAutoresizingFlexibleWidth;
+    _rule = [UIView new];
+    _rule.backgroundColor = RuleColor();
     [self.view addSubview:_rule];
 }
 - (UIButton *)segButton:(NSString *)t tag:(NSInteger)tag {
@@ -164,8 +174,10 @@ static NSString *Ago(NSDate *d) {
     [band addSubview:l]; return band;
 }
 - (void)rebuildToday {
-    for (UIView *v in [_today.subviews copy]) [v removeFromSuperview];
     CGFloat w = self.view.bounds.size.width, y = 22;
+    if (w < 1) return;                       // pas encore mis en page
+    _builtWidth = w;
+    for (UIView *v in [_today.subviews copy]) [v removeFromSuperview];
 
     NSDateFormatter *df = [NSDateFormatter new];
     df.dateFormat = [NSDateFormatter dateFormatFromTemplate:@"EEEEMMMMd" options:0 locale:NSLocale.currentLocale];
@@ -180,7 +192,7 @@ static NSString *Ago(NSDate *d) {
     // Widget Batteries (iPhone). Watch / AirPods : phase 2 via BatteryCenter.
     UIDevice.currentDevice.batteryMonitoringEnabled = YES;
     float lvl = UIDevice.currentDevice.batteryLevel; int pct = lvl < 0 ? 0 : (int)roundf(lvl * 100);
-    [_today addSubview:[self sectionBand:NCI9L(@"batteries") icon:AppIcon(@"", 20) width:w y:y]]; y += kSectionH;
+    [_today addSubview:[self sectionBand:NCI9L(@"batteries") icon:BatteryIcon(20) width:w y:y]]; y += kSectionH;
     UILabel *name = [[UILabel alloc] initWithFrame:CGRectMake(kTextX, y, 160, 44)];
     name.text = NCI9L(@"iphone"); name.textColor = UIColor.whiteColor; name.font = [UIFont systemFontOfSize:17];
     [_today addSubview:name];
@@ -209,10 +221,11 @@ static NSString *Ago(NSDate *d) {
     _today.contentSize = CGSizeMake(w, y);
 }
 - (void)openSettings {
-    // TODO : ouvrir le panneau Réglages (PreferenceLoader) : prefs:root=NCNine
-    NSURL *u = [NSURL URLWithString:@"prefs:root=NCNine"];
-    [UIApplication.sharedApplication openURL:u options:@{} completionHandler:nil];
+    // Le panneau de réglages dédié n'existe pas encore : on ouvre l'app Réglages.
     if (self.requestDismiss) self.requestDismiss();
+    id app = UIApplication.sharedApplication;
+    if ([app respondsToSelector:@selector(launchApplicationWithIdentifier:suspended:)])
+        [(SpringBoard *)app launchApplicationWithIdentifier:@"com.apple.Preferences" suspended:NO];
 }
 
 // ---- Notifications ----
@@ -301,6 +314,8 @@ static NSString *Ago(NSDate *d) {
 - (void)viewDidLayoutSubviews {
     [super viewDidLayoutSubviews];
     CGFloat w = self.view.bounds.size.width, h = self.view.bounds.size.height;
+    _segBox.frame = CGRectMake(kSegX, kSegY, w - 2 * kSegX, kSegH);
+    _rule.frame = CGRectMake(0, kRuleY, w, 1 / UIScreen.mainScreen.scale);
     CGFloat top = kRuleY + 1, bottom = h - kHandleH;
     _today.frame = CGRectMake(0, top, w, bottom - top);
     _table.frame = _today.frame;
@@ -309,6 +324,6 @@ static NSString *Ago(NSDate *d) {
     CALayer *chev = nil; for (CALayer *l in _handle.layer.sublayers) if ([l.name isEqual:@"chev"]) chev = l;
     chev.position = CGPointMake(w / 2, kHandleH / 2);
     [self layoutSegment];
-    if (_tab == 0 && _today.subviews.count == 0) [self rebuildToday];
+    if (_tab == 0 && fabs(_builtWidth - w) > 0.5) [self rebuildToday];
 }
 @end
