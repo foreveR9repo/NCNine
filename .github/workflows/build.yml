@@ -9,24 +9,37 @@ jobs:
   build:
     runs-on: macos-latest
     steps:
-      - name: Checkout
+      - name: Checkout project
         uses: actions/checkout@v4
+
+      - name: Checkout Theos
+        uses: actions/checkout@v4
+        with:
+          repository: theos/theos
+          path: theos
+
+      - name: Theos submodules (3 attempts)
+        env:
+          GIT_TERMINAL_PROMPT: "0"
+        run: |
+          cd "$GITHUB_WORKSPACE/theos"
+          for i in 1 2 3; do
+            git submodule update --init --recursive && break
+            echo "Attempt $i failed, retrying..."; sleep 8
+          done
+          git submodule status
 
       - name: Install dependencies
         run: brew install ldid dpkg make
 
-      - name: Install Theos
+      - name: Show available iOS SDKs (Xcode)
         run: |
-          git clone --recursive https://github.com/theos/theos.git "$HOME/theos"
-          echo "THEOS=$HOME/theos" >> $GITHUB_ENV
-
-      - name: Install iOS SDKs
-        run: |
-          git clone --depth=1 https://github.com/theos/sdks.git "$HOME/sdks"
-          cp -R "$HOME/sdks/"*.sdk "$HOME/theos/sdks/"
-          ls "$HOME/theos/sdks"
+          xcodebuild -showsdks | grep -i iphoneos || true
+          xcrun --sdk iphoneos --show-sdk-path
 
       - name: Build rootless package
+        env:
+          THEOS: ${{ github.workspace }}/theos
         run: |
           export PATH="$(brew --prefix make)/libexec/gnubin:$PATH"
           make clean package FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=rootless
