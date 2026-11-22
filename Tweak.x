@@ -1,12 +1,21 @@
 #import <UIKit/UIKit.h>
-#import <notify.h>
 #import <objc/runtime.h>
+#import <string.h>
 #import "NCI9Store.h"
 #import "NCI9ViewController.h"
 
-// ---------------------------------------------------------------------------
-// Déclarations minimales (classes privées SpringBoard)
-// ---------------------------------------------------------------------------
+// ===========================================================================
+// NCNine : règles de sécurité de ce fichier
+//  1. Rien n'est touché pendant le chargement (%ctor). Tout démarre 6 s après,
+//     quand SpringBoard a fini de s'initialiser.
+//  2. Un hook n'est installé que si la méthode existe ET que son encodage de
+//     type est exactement celui attendu (sinon il est ignoré et journalisé).
+//  3. Garde anti-crash : si SpringBoard a planté après notre dernier démarrage,
+//     le tweak se désactive tout seul (fichier /var/mobile/Library/NCNine.boot).
+//  4. On ne hooke AUCUNE méthode de verrouillage ni de présentation du
+//     CoverSheet : seuls les gestes de swipe depuis le haut sont ciblés.
+// ===========================================================================
+
 @interface SBLockScreenManager : NSObject
 + (instancetype)sharedInstance;
 - (BOOL)isUILocked;
@@ -26,7 +35,9 @@
 - (void)_setSecure:(BOOL)secure;
 @end
 
-// Log fichier : /var/mobile/Library/Logs/NCNine.log (lisible avec Filza)
+// ---------------------------------------------------------------------------
+// Journal : /var/mobile/Library/Logs/NCNine.log
+// ---------------------------------------------------------------------------
 static void NCLogString(NSString *msg) {
     NSLog(@"[NCNine] %@", msg);
     static dispatch_queue_t q; static dispatch_once_t t;
@@ -49,10 +60,12 @@ static void NCLogString(NSString *msg) {
 static UIWindow *gWindow;
 static NCI9ViewController *gVC;
 static BOOL gVisible;
-static CFAbsoluteTime gLastLockEvent;   // dernier changement d'état verrouillage / écran
+static CFAbsoluteTime gLastLockEvent;
 
 static BOOL NCIsUnlocked(void) {
-    id m = [NSClassFromString(@"SBLockScreenManager") sharedInstance];
+    Class c = NSClassFromString(@"SBLockScreenManager");
+    if (!c || ![c respondsToSelector:@selector(sharedInstance)]) return NO;
+    id m = [c sharedInstance];
     if (![m respondsToSelector:@selector(isUILocked)]) return NO;   // doute => on ne touche à rien
     return ![(SBLockScreenManager *)m isUILocked];
 }
@@ -76,7 +89,7 @@ static void NCShow(void) {
     gVisible = YES;
     CGRect b = UIScreen.mainScreen.bounds;
     gWindow = [[UIWindow alloc] initWithFrame:b];
-    gWindow.windowLevel = UIWindowLevelAlert + 1000;   // au-dessus de l'app et des bannières
+    gWindow.windowLevel = UIWindowLevelAlert + 1000;
     if ([gWindow respondsToSelector:@selector(_setSecure:)]) [gWindow _setSecure:YES];
     gWindow.backgroundColor = UIColor.clearColor;
     gVC = [NCI9ViewController new];
@@ -84,38 +97,24 @@ static void NCShow(void) {
     gWindow.rootViewController = gVC;
     gWindow.transform = CGAffineTransformMakeTranslation(0, -b.size.height);
     gWindow.hidden = NO;
+    NCLOG(@"NC affiché: scene=%@ hidden=%d", gWindow.windowScene, gWindow.hidden);
     [UIView animateWithDuration:.32 delay:0 usingSpringWithDamping:.95 initialSpringVelocity:0 options:0 animations:^{
         gWindow.transform = CGAffineTransformIdentity;
     } completion:nil];
 }
 
-// ---------------------------------------------------------------------------
-// Décision : intercepter ou laisser le CoverSheet natif ?
-// On n'intercepte QUE si :
-//  - l'appareil est déverrouillé,
-//  - aucun changement d'état verrouillage / écran dans la dernière seconde
-//    (bouton latéral, réveil, déverrouillage),
-//  - le CoverSheet n'est pas déjà présenté,
-//  - notre NC n'est pas déjà visible.
-// ---------------------------------------------------------------------------
 static BOOL NCShouldIntercept(void) {
     if (gVisible) return NO;
     if (!NCIsUnlocked()) return NO;
     if (CFAbsoluteTimeGetCurrent() - gLastLockEvent < 1.0) return NO;
-    id pm = [NSClassFromString(@"SBCoverSheetPresentationManager") sharedInstance];
-    if ([pm respondsToSelector:@selector(isPresented)] && [(SBCoverSheetPresentationManager *)pm isPresented]) return NO;
+    Class pc = NSClassFromString(@"SBCoverSheetPresentationManager");
+    if (pc && [pc respondsToSelector:@selector(sharedInstance)]) {
+        id pm = [pc sharedInstance];
+        if ([pm respondsToSelector:@selector(isPresented)] && [(SBCoverSheetPresentationManager *)pm isPresented]) return NO;
+    }
     return YES;
 }
 
-// ---------------------------------------------------------------------------
-// Hooks
-// ---------------------------------------------------------------------------
-
-
-// Couche 0 : hooks CIBLÉS sur les deux reconnaisseurs de geste du CoverSheet
-// (classes présentes dans les headers iOS 16.3). On n'accroche plus UIGestureRecognizer
-// globalement : un hook sur un chemin aussi chaud peut faire crasher SpringBoard.
-// Si on est déverrouillé, le geste natif échoue (Possible -> Failed) et on affiche notre NC.
 static BOOL NCSwallowCoverSheetGesture(id g, UIGestureRecognizerState state) {
     if (state != UIGestureRecognizerStateBegan) return NO;
     if (!NCShouldIntercept()) return NO;
@@ -124,95 +123,116 @@ static BOOL NCSwallowCoverSheetGesture(id g, UIGestureRecognizerState state) {
     return YES;
 }
 
+// ---------------------------------------------------------------------------
+// Hooks (chacun dans un groupe, installé seulement s'il est sûr)
+// ---------------------------------------------------------------------------
+%group GEdgePan
 %hook SBCoverSheetScreenEdgePanGestureRecognizer
 - (void)setState:(UIGestureRecognizerState)state {
     if (NCSwallowCoverSheetGesture(self, state)) { %orig(UIGestureRecognizerStateFailed); return; }
     %orig;
 }
 %end
+%end
 
+%group GPresentationGesture
 %hook SBCoverSheetPresentationGestureRecognizer
 - (void)setState:(UIGestureRecognizerState)state {
     if (NCSwallowCoverSheetGesture(self, state)) { %orig(UIGestureRecognizerStateFailed); return; }
     %orig;
 }
 %end
-
-// Couche 1 : le geste de swipe-down lui-même.
-// Le delegate des gestes système du CoverSheet décide si le geste démarre.
-// Si on est déverrouillé : on affiche notre NC et on refuse le geste natif,
-// donc le rideau natif n'apparaît jamais, même pas à moitié.
-%hook SBCoverSheetSystemGesturesDelegate
-- (BOOL)gestureRecognizerShouldBegin:(UIGestureRecognizer *)g {
-    BOOL r = %orig;
-    if (!r) return r;
-    if (![g isKindOfClass:UIPanGestureRecognizer.class]) return r;
-    if (!NCShouldIntercept()) return r;
-    CGPoint p = [g locationInView:g.view];
-    if (p.y > 150) return r;               // geste parti du haut de l'écran uniquement
-    NCLOG(@"swipe-down déverrouillé -> NC iOS 9 (geste bloqué)");
-    dispatch_async(dispatch_get_main_queue(), ^{ NCShow(); });
-    return NO;
-}
 %end
 
-// Couche 2 (filet de sécurité) : si le CoverSheet est tout de même présenté
-// alors qu'on est déverrouillé, on demande l'état « non présenté » au lieu de
-// bloquer l'appel : l'original gère lui-même sa complétion.
-%hook SBCoverSheetPresentationManager
-- (void)setCoverSheetPresented:(BOOL)presented animated:(BOOL)animated withCompletion:(id)completion {
-    if (presented && NCShouldIntercept()) {
-        dispatch_async(dispatch_get_main_queue(), ^{ NCShow(); });
-        %orig(NO, animated, completion);
-        return;
-    }
-    %orig;
-}
-%end
-
-// Source de notifications : toute notification postée passe par le dispatcher.
+%group GNotifications
 %hook NCNotificationDispatcher
 - (void)postNotificationWithRequest:(id)request {
     %orig;
     [[NCI9Store shared] addRequest:request];
 }
 %end
-
-// Bouton Home physique (SE 2020) : ferme le NC custom.
-%hook SBHomeHardwareButtonActions
-- (void)performSinglePressUpActions {
-    if (gVisible) { NCHide(YES); return; }
-    %orig;
-}
 %end
 
 // ---------------------------------------------------------------------------
-// Notifications Darwin : verrouillage / extinction / réveil de l'écran.
-// Remplace le hook de lockUIFromSource: (signature incertaine selon la version).
+// Vérifications passives
 // ---------------------------------------------------------------------------
+static const char *NCEncoding(NSString *cls, NSString *sel, BOOL classMethod) {
+    Class c = NSClassFromString(cls);
+    if (!c) return NULL;
+    SEL s = NSSelectorFromString(sel);
+    Method m = classMethod ? class_getClassMethod(c, s) : class_getInstanceMethod(c, s);
+    return m ? method_getTypeEncoding(m) : NULL;
+}
+
+static BOOL NCCanHook(NSString *cls, NSString *sel, const char *expected) {
+    const char *e = NCEncoding(cls, sel, NO);
+    BOOL ok = (e != NULL) && strcmp(e, expected) == 0;
+    NCLOG(@"%@ %@ : %s -> %@", cls, sel, e ? e : "ABSENT", ok ? @"hook installé" : @"hook NON installé");
+    return ok;
+}
+
+static void NCProbe(NSString *cls, NSString *sel, BOOL classMethod) {
+    const char *e = NCEncoding(cls, sel, classMethod);
+    NCLOG(@"[sonde] %@ %@ : %s", cls, sel, e ? e : "ABSENT");
+}
+
+// ---------------------------------------------------------------------------
+// Garde anti-crash
+// ---------------------------------------------------------------------------
+static NSString *const kBootPath = @"/var/mobile/Library/NCNine.boot";
+
+static BOOL NCCrashGuardAllowsStart(void) {
+    NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:kBootPath];
+    NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
+    if (d && ![d[@"stable"] boolValue] && now - [d[@"t"] doubleValue] < 600) return NO;
+    [@{@"t": @(now), @"stable": @NO} writeToFile:kBootPath atomically:YES];
+    return YES;
+}
+
+static void NCMarkStable(void) {
+    [@{@"t": @([[NSDate date] timeIntervalSince1970]), @"stable": @YES} writeToFile:kBootPath atomically:YES];
+}
+
 static void NCLockEvent(CFNotificationCenterRef c, void *o, CFStringRef n, const void *obj, CFDictionaryRef u) {
     gLastLockEvent = CFAbsoluteTimeGetCurrent();
     dispatch_async(dispatch_get_main_queue(), ^{ NCHide(NO); });
 }
 
-%ctor {
+// ---------------------------------------------------------------------------
+// Démarrage différé
+// ---------------------------------------------------------------------------
+static void NCStart(void) {
+    NCLOG(@"démarrage différé. iOS %@", UIDevice.currentDevice.systemVersion);
+    if (!NCCrashGuardAllowsStart()) {
+        NCLOG(@"GARDE ANTI-CRASH: SpringBoard a planté après le dernier démarrage, tweak désactivé. Supprime %@ pour le réactiver.", kBootPath);
+        return;
+    }
+
+    // Sondes passives (aucun effet, elles servent à régler les hooks suivants)
+    NCProbe(@"SBLockScreenManager", @"isUILocked", NO);
+    NCProbe(@"SBCoverSheetPresentationManager", @"isPresented", NO);
+    NCProbe(@"SBCoverSheetPresentationManager", @"setCoverSheetPresented:animated:withCompletion:", NO);
+    NCProbe(@"SBHomeHardwareButtonActions", @"performSinglePressUpActions", NO);
+    NCProbe(@"SBCoverSheetSystemGesturesDelegate", @"gestureRecognizerShouldBegin:", NO);
+
+    // setState: attendu : void, (id)self, (SEL)_cmd, (NSInteger)state
+    if (NCCanHook(@"SBCoverSheetScreenEdgePanGestureRecognizer", @"setState:", "v24@0:8q16")) { %init(GEdgePan); }
+    if (NCCanHook(@"SBCoverSheetPresentationGestureRecognizer", @"setState:", "v24@0:8q16")) { %init(GPresentationGesture); }
+    if (NCCanHook(@"NCNotificationDispatcher", @"postNotificationWithRequest:", "v24@0:8@16")) { %init(GNotifications); }
+
     CFNotificationCenterRef d = CFNotificationCenterGetDarwinNotifyCenter();
     CFNotificationCenterAddObserver(d, NULL, NCLockEvent, CFSTR("com.apple.springboard.lockstate"), NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
     CFNotificationCenterAddObserver(d, NULL, NCLockEvent, CFSTR("com.apple.springboard.hasBlankedScreen"), NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
 
-    // Rotation : on referme (layout paysage non reproduit). On ignore à plat / inconnu.
-    [[NSNotificationCenter defaultCenter] addObserverForName:UIDeviceOrientationDidChangeNotification
-                                                      object:nil queue:NSOperationQueue.mainQueue
-                                                  usingBlock:^(NSNotification *n) {
-        UIDeviceOrientation o = UIDevice.currentDevice.orientation;
-        if (UIDeviceOrientationIsPortrait(o) || UIDeviceOrientationIsLandscape(o)) NCHide(NO);
-    }];
-    [UIDevice.currentDevice beginGeneratingDeviceOrientationNotifications];
-    NCLOG(@"chargé. iOS %@", UIDevice.currentDevice.systemVersion);
-    for (NSString *c in @[@"SBLockScreenManager", @"SBCoverSheetPresentationManager", @"SBCoverSheetSystemGesturesDelegate",
-                          @"SBCoverSheetScreenEdgePanGestureRecognizer", @"SBCoverSheetPresentationGestureRecognizer",
-                          @"NCNotificationDispatcher", @"SBHomeHardwareButtonActions"])
-        NCLOG(@"classe %@ : %@", c, NSClassFromString(c) ? @"présente" : @"ABSENTE");
-    id lm = [NSClassFromString(@"SBLockScreenManager") sharedInstance];
-    NCLOG(@"isUILocked disponible : %d", [lm respondsToSelector:@selector(isUILocked)]);
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(30 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        NCMarkStable();
+        NCLOG(@"stable depuis 30 s");
+    });
+}
+
+%ctor {
+    // Rien d'autre ici : on ne touche à aucune classe SpringBoard pendant le chargement.
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(6 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        NCStart();
+    });
 }

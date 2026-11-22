@@ -2,24 +2,15 @@
 
 Build : `make package` (Theos, THEOS_PACKAGE_SCHEME=rootless déjà dans le Makefile) puis installer le .deb avec Dopamine.
 
-## Ce qui est certain / à valider
-Non testé sur appareil : je n'ai pas accès à ton iPhone. Les noms de classes privées ci-dessous
-sont ceux que je connais pour iOS 15-17, à confirmer avec `class-dump`/FLEX sur ta version exacte.
-
-| Hook | Rôle | Confiance |
-|---|---|---|
-| `SBLockScreenManager -isUILocked` | savoir si l'appareil est verrouillé | élevée |
-| Darwin `com.apple.springboard.lockstate` / `hasBlankedScreen` | détecter verrouillage / réveil (remplace un hook de méthode) | élevée |
-| `SBCoverSheetSystemGesturesDelegate -gestureRecognizerShouldBegin:` | **couche 1** : bloquer le swipe natif et afficher le NC | **à valider** (nom de classe) |
-| `SBCoverSheetPresentationManager -setCoverSheetPresented:animated:withCompletion:` | **couche 2** : filet de sécurité | moyenne |
-| `NCNotificationDispatcher -postNotificationWithRequest:` | récupérer les notifications en direct | moyenne |
-| `SBHomeHardwareButtonActions -performSinglePressUpActions` | bouton Home ferme le NC | moyenne |
-
-## Comment valider au premier test
-Chaque hook de geste écrit une ligne `[NCNine] ...` dans les logs. Fais un swipe-down déverrouillé :
-- ligne `gestureRecognizerShouldBegin` + NC iOS 9 : la couche 1 fonctionne ;
-- seulement `setCoverSheetPresented` : la couche 1 n'est pas la bonne classe, la couche 2 prend le relais (un bout de rideau natif peut apparaître) ;
-- aucune ligne : les deux noms de classes sont faux pour ta version.
+## Sécurité (v0.2)
+- Aucun code ne s'exécute au chargement : tout démarre 6 s après, quand SpringBoard est prêt.
+- Un hook n'est installé que si la méthode existe avec l'encodage de type attendu ; sinon il est ignoré
+  et l'encodage réel est écrit dans le journal (`/var/mobile/Library/Logs/NCNine.log`).
+- Aucun hook sur le verrouillage ni sur la présentation du CoverSheet. Seuls les gestes de swipe
+  `SBCoverSheetScreenEdgePanGestureRecognizer` / `SBCoverSheetPresentationGestureRecognizer` sont ciblés.
+- Garde anti-crash : si SpringBoard plante avant 30 s après le démarrage du tweak, il se désactive au
+  démarrage suivant (10 min). Pour le réactiver : supprimer `/var/mobile/Library/NCNine.boot`.
+- Pas encore gérés : bouton Home qui ferme le NC (signature à vérifier avec les sondes), rotation.
 
 ## Debug sans respring loop
 - Tout est gardé par `respondsToSelector:` / `@try`. En cas de doute, on laisse le CoverSheet natif.
