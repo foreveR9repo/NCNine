@@ -16,6 +16,11 @@
 - (BOOL)isPresented;
 @end
 
+@interface SBCoverSheetScreenEdgePanGestureRecognizer : UIGestureRecognizer
+@end
+@interface SBCoverSheetPresentationGestureRecognizer : UIGestureRecognizer
+@end
+
 @interface UIWindow (NCNinePrivate)
 - (void)_setSecure:(BOOL)secure;
 @end
@@ -106,32 +111,28 @@ static BOOL NCShouldIntercept(void) {
 // ---------------------------------------------------------------------------
 
 
-// Couche 0 (la plus fiable) : on intercepte l'état du reconnaisseur de geste
-// du CoverSheet lui-même. Ne dépend d'aucun nom de méthode du CoverSheet :
-// seules les classes SBCoverSheetScreenEdgePanGestureRecognizer /
-// SBCoverSheetPresentationGestureRecognizer (présentes dans les headers iOS 16.3)
-// sont ciblées. Si on est déverrouillé, on fait ÉCHOUER le geste natif
-// (Possible -> Failed, transition légale) et on affiche notre NC.
-%hook UIGestureRecognizer
+// Couche 0 : hooks CIBLÉS sur les deux reconnaisseurs de geste du CoverSheet
+// (classes présentes dans les headers iOS 16.3). On n'accroche plus UIGestureRecognizer
+// globalement : un hook sur un chemin aussi chaud peut faire crasher SpringBoard.
+// Si on est déverrouillé, le geste natif échoue (Possible -> Failed) et on affiche notre NC.
+static BOOL NCSwallowCoverSheetGesture(id g, UIGestureRecognizerState state) {
+    if (state != UIGestureRecognizerStateBegan) return NO;
+    if (!NCShouldIntercept()) return NO;
+    NCLOG(@"swipe-down déverrouillé: geste %@ annulé -> NC iOS 9", NSStringFromClass(object_getClass(g)));
+    dispatch_async(dispatch_get_main_queue(), ^{ NCShow(); });
+    return YES;
+}
+
+%hook SBCoverSheetScreenEdgePanGestureRecognizer
 - (void)setState:(UIGestureRecognizerState)state {
-    if (state == UIGestureRecognizerStateBegan) {
-        NSString *cn = NSStringFromClass(object_getClass(self));
-        BOOL isCover = [cn hasPrefix:@"SBCoverSheet"];
-        if (isCover || [cn hasPrefix:@"SB"] || [cn hasPrefix:@"CS"]) {
-            static NSMutableSet *seen; static dispatch_once_t t;
-            dispatch_once(&t, ^{ seen = [NSMutableSet new]; });
-            if (isCover || ![seen containsObject:cn]) {
-                [seen addObject:cn];
-                NCLOG(@"geste Began: %@ unlocked=%d intercept=%d", cn, NCIsUnlocked(), NCShouldIntercept());
-            }
-        }
-        if (isCover && ([cn containsString:@"ScreenEdgePan"] || [cn containsString:@"PresentationGesture"]) && NCShouldIntercept()) {
-            NCLOG(@"swipe-down déverrouillé: geste %@ annulé -> NC iOS 9", cn);
-            %orig(UIGestureRecognizerStateFailed);
-            dispatch_async(dispatch_get_main_queue(), ^{ NCShow(); });
-            return;
-        }
-    }
+    if (NCSwallowCoverSheetGesture(self, state)) { %orig(UIGestureRecognizerStateFailed); return; }
+    %orig;
+}
+%end
+
+%hook SBCoverSheetPresentationGestureRecognizer
+- (void)setState:(UIGestureRecognizerState)state {
+    if (NCSwallowCoverSheetGesture(self, state)) { %orig(UIGestureRecognizerStateFailed); return; }
     %orig;
 }
 %end
@@ -144,7 +145,6 @@ static BOOL NCShouldIntercept(void) {
 - (BOOL)gestureRecognizerShouldBegin:(UIGestureRecognizer *)g {
     BOOL r = %orig;
     if (!r) return r;
-    NCLOG(@"gestureRecognizerShouldBegin: %@ state-unlocked=%d", NSStringFromClass(g.class), NCIsUnlocked());
     if (![g isKindOfClass:UIPanGestureRecognizer.class]) return r;
     if (!NCShouldIntercept()) return r;
     CGPoint p = [g locationInView:g.view];
@@ -160,7 +160,6 @@ static BOOL NCShouldIntercept(void) {
 // bloquer l'appel : l'original gère lui-même sa complétion.
 %hook SBCoverSheetPresentationManager
 - (void)setCoverSheetPresented:(BOOL)presented animated:(BOOL)animated withCompletion:(id)completion {
-    NCLOG(@"setCoverSheetPresented:%d unlocked=%d", presented, NCIsUnlocked());
     if (presented && NCShouldIntercept()) {
         dispatch_async(dispatch_get_main_queue(), ^{ NCShow(); });
         %orig(NO, animated, completion);
