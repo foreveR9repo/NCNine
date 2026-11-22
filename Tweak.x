@@ -61,6 +61,7 @@ static UIWindow *gWindow;
 static NCI9ViewController *gVC;
 static BOOL gVisible;
 static CFAbsoluteTime gLastLockEvent;
+static CFAbsoluteTime gLastIntercept;   // dernier swipe que NOUS avons intercepté
 
 static BOOL NCIsUnlocked(void) {
     Class c = NSClassFromString(@"SBLockScreenManager");
@@ -84,11 +85,25 @@ static void NCHide(BOOL animated) {
     } completion:done];
 }
 
+static UIWindowScene *NCMainScene(void) {
+    UIWindowScene *fallback = nil;
+    for (UIScene *sc in UIApplication.sharedApplication.connectedScenes) {
+        if (![sc isKindOfClass:UIWindowScene.class]) continue;
+        UIWindowScene *ws = (UIWindowScene *)sc;
+        if (ws.screen != UIScreen.mainScreen) continue;
+        if ([NSStringFromClass(ws.class) hasPrefix:@"SBWindowScene"]) return ws;
+        if (!fallback) fallback = ws;
+    }
+    return fallback;
+}
+
 static void NCShow(void) {
     if (gVisible) return;
     gVisible = YES;
     CGRect b = UIScreen.mainScreen.bounds;
-    gWindow = [[UIWindow alloc] initWithFrame:b];
+    UIWindowScene *ws = NCMainScene();
+    gWindow = ws ? [[UIWindow alloc] initWithWindowScene:ws] : [[UIWindow alloc] initWithFrame:b];
+    gWindow.frame = b;
     gWindow.windowLevel = UIWindowLevelAlert + 1000;
     if ([gWindow respondsToSelector:@selector(_setSecure:)]) [gWindow _setSecure:YES];
     gWindow.backgroundColor = UIColor.clearColor;
@@ -97,7 +112,7 @@ static void NCShow(void) {
     gWindow.rootViewController = gVC;
     gWindow.transform = CGAffineTransformMakeTranslation(0, -b.size.height);
     gWindow.hidden = NO;
-    NCLOG(@"NC affiché: scene=%@ hidden=%d", gWindow.windowScene, gWindow.hidden);
+    NCLOG(@"NC affiché: scene=%@ (%@) hidden=%d", gWindow.windowScene, ws ? NSStringFromClass(ws.class) : @"aucune scène trouvée", gWindow.hidden);
     [UIView animateWithDuration:.32 delay:0 usingSpringWithDamping:.95 initialSpringVelocity:0 options:0 animations:^{
         gWindow.transform = CGAffineTransformIdentity;
     } completion:nil];
@@ -115,11 +130,25 @@ static BOOL NCShouldIntercept(void) {
     return YES;
 }
 
+static void NCReportAfterIntercept(void) {
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.6 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        Class pc = NSClassFromString(@"SBCoverSheetPresentationManager");
+        BOOL presented = NO;
+        if (pc && [pc respondsToSelector:@selector(sharedInstance)]) {
+            id pm = [pc sharedInstance];
+            if ([pm respondsToSelector:@selector(isPresented)]) presented = [(SBCoverSheetPresentationManager *)pm isPresented];
+        }
+        NCLOG(@"0.6 s après interception: CoverSheet natif présenté=%d, notre NC visible=%d", presented, gVisible);
+    });
+}
+
 static BOOL NCSwallowCoverSheetGesture(id g, UIGestureRecognizerState state) {
     if (state != UIGestureRecognizerStateBegan) return NO;
     if (!NCShouldIntercept()) return NO;
     NCLOG(@"swipe-down déverrouillé: geste %@ annulé -> NC iOS 9", NSStringFromClass([g class]));
+    gLastIntercept = CFAbsoluteTimeGetCurrent();
     dispatch_async(dispatch_get_main_queue(), ^{ NCShow(); });
+    NCReportAfterIntercept();
     return YES;
 }
 
@@ -140,6 +169,34 @@ static BOOL NCSwallowCoverSheetGesture(id g, UIGestureRecognizerState state) {
 - (void)setState:(UIGestureRecognizerState)state {
     if (NCSwallowCoverSheetGesture(self, state)) { %orig(UIGestureRecognizerStateFailed); return; }
     %orig;
+}
+%end
+%end
+
+// Présentation du CoverSheet : on ne bloque QUE dans la seconde et demie qui suit
+// un swipe que nous avons nous-mêmes intercepté. Le verrouillage, le bouton latéral
+// et le déverrouillage ne sont jamais concernés. Le reste est seulement journalisé.
+%group GPresentation
+%hook SBCoverSheetPresentationManager
+- (void)setCoverSheetPresented:(BOOL)presented animated:(BOOL)animated withCompletion:(id)completion {
+    BOOL recent = (CFAbsoluteTimeGetCurrent() - gLastIntercept) < 1.5;
+    NCLOG(@"setCoverSheetPresented:%d animated:%d récent=%d", presented, animated, recent);
+    if (presented && recent) { %orig(NO, animated, completion); return; }
+    %orig;
+}
+%end
+%end
+
+// Delegate des gestes du CoverSheet : journalise quel geste demande à démarrer.
+// Ne change rien, sauf juste après une interception de notre part.
+%group GDelegate
+%hook SBCoverSheetSystemGesturesDelegate
+- (BOOL)gestureRecognizerShouldBegin:(UIGestureRecognizer *)g {
+    BOOL r = %orig;
+    BOOL recent = (CFAbsoluteTimeGetCurrent() - gLastIntercept) < 1.0;
+    NCLOG(@"delegate shouldBegin: %@ orig=%d récent=%d", NSStringFromClass([g class]), r, recent);
+    if (recent && r) return NO;
+    return r;
 }
 %end
 %end
@@ -208,16 +265,18 @@ static void NCStart(void) {
         return;
     }
 
+    for (UIScene *sc in UIApplication.sharedApplication.connectedScenes) NCLOG(@"scène: %@", sc);
+
     // Sondes passives (aucun effet, elles servent à régler les hooks suivants)
     NCProbe(@"SBLockScreenManager", @"isUILocked", NO);
     NCProbe(@"SBCoverSheetPresentationManager", @"isPresented", NO);
-    NCProbe(@"SBCoverSheetPresentationManager", @"setCoverSheetPresented:animated:withCompletion:", NO);
     NCProbe(@"SBHomeHardwareButtonActions", @"performSinglePressUpActions", NO);
-    NCProbe(@"SBCoverSheetSystemGesturesDelegate", @"gestureRecognizerShouldBegin:", NO);
 
     // setState: attendu : void, (id)self, (SEL)_cmd, (NSInteger)state
     if (NCCanHook(@"SBCoverSheetScreenEdgePanGestureRecognizer", @"setState:", "v24@0:8q16")) { %init(GEdgePan); }
     if (NCCanHook(@"SBCoverSheetPresentationGestureRecognizer", @"setState:", "v24@0:8q16")) { %init(GPresentationGesture); }
+    if (NCCanHook(@"SBCoverSheetPresentationManager", @"setCoverSheetPresented:animated:withCompletion:", "v32@0:8B16B20@?24")) { %init(GPresentation); }
+    if (NCCanHook(@"SBCoverSheetSystemGesturesDelegate", @"gestureRecognizerShouldBegin:", "B24@0:8@16")) { %init(GDelegate); }
     if (NCCanHook(@"NCNotificationDispatcher", @"postNotificationWithRequest:", "v24@0:8@16")) { %init(GNotifications); }
 
     CFNotificationCenterRef d = CFNotificationCenterGetDarwinNotifyCenter();
