@@ -1,5 +1,6 @@
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
+#import <objc/message.h>
 #import <string.h>
 #import "NCI9Store.h"
 #import "NCI9ViewController.h"
@@ -71,18 +72,17 @@ static BOOL NCIsUnlocked(void) {
     return ![(SBLockScreenManager *)m isUILocked];
 }
 
-static void NCHide(BOOL animated) {
+static void NCHideWhy(BOOL animated, NSString *why) {
     if (!gVisible) return;
+    NCLOG(@"NC fermé par NOTRE code. animated=%d raison=%@", animated, why);
     gVisible = NO;
-    UIWindow *w = gWindow;
-    void (^done)(BOOL) = ^(BOOL f) {
+    UIWindow *w = gWindow; NCI9ViewController *vc = gVC;
+    void (^done)(void) = ^{
         w.hidden = YES;
         if (gWindow == w) { gWindow = nil; gVC = nil; }
     };
-    if (!animated) { done(YES); return; }
-    [UIView animateWithDuration:.28 delay:0 options:UIViewAnimationOptionCurveEaseIn animations:^{
-        w.transform = CGAffineTransformMakeTranslation(0, -w.bounds.size.height);
-    } completion:done];
+    if (!animated || !vc) { done(); return; }
+    [vc animateOutWithCompletion:done];
 }
 
 static UIWindowScene *NCMainScene(void) {
@@ -108,18 +108,18 @@ static void NCShow(void) {
     if ([gWindow respondsToSelector:@selector(_setSecure:)]) [gWindow _setSecure:YES];
     gWindow.backgroundColor = UIColor.clearColor;
     gVC = [NCI9ViewController new];
-    gVC.requestDismiss = ^{ NCHide(YES); };
+    gVC.requestDismiss = ^{ NCHideWhy(YES, @"poignée / glissement vers le haut / tap notification / Edit"); };
     gWindow.rootViewController = gVC;
-    gWindow.transform = CGAffineTransformMakeTranslation(0, -b.size.height);
     gWindow.hidden = NO;
     NCLOG(@"NC affiché: scene=%@ (%@) hidden=%d", gWindow.windowScene, ws ? NSStringFromClass(ws.class) : @"aucune scène trouvée", gWindow.hidden);
-    [UIView animateWithDuration:.32 delay:0 usingSpringWithDamping:.95 initialSpringVelocity:0 options:0 animations:^{
-        gWindow.transform = CGAffineTransformIdentity;
-    } completion:nil];
+    [gVC animateIn];
 }
 
+// Vrai = un geste de PRÉSENTATION du CoverSheet doit être annulé : appareil déverrouillé,
+// pas de verrouillage / réveil à l'instant, rideau natif pas déjà présenté.
+// (Ne dépend PAS de gVisible : un même swipe active plusieurs reconnaisseurs et tous
+//  doivent être annulés, pas seulement le premier.)
 static BOOL NCShouldIntercept(void) {
-    if (gVisible) return NO;
     if (!NCIsUnlocked()) return NO;
     if (CFAbsoluteTimeGetCurrent() - gLastLockEvent < 1.0) return NO;
     Class pc = NSClassFromString(@"SBCoverSheetPresentationManager");
@@ -130,23 +130,39 @@ static BOOL NCShouldIntercept(void) {
     return YES;
 }
 
-static void NCReportAfterIntercept(void) {
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.6 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        Class pc = NSClassFromString(@"SBCoverSheetPresentationManager");
-        BOOL presented = NO;
-        if (pc && [pc respondsToSelector:@selector(sharedInstance)]) {
-            id pm = [pc sharedInstance];
-            if ([pm respondsToSelector:@selector(isPresented)]) presented = [(SBCoverSheetPresentationManager *)pm isPresented];
+static void NCCheckNativeCoverSheet(NSString *when) {
+    Class pc = NSClassFromString(@"SBCoverSheetPresentationManager");
+    if (!pc || ![pc respondsToSelector:@selector(sharedInstance)]) return;
+    id pm = [pc sharedInstance];
+    if (![pm respondsToSelector:@selector(isPresented)]) return;
+    BOOL presented = [(SBCoverSheetPresentationManager *)pm isPresented];
+    NCLOG(@"%@: CoverSheet natif présenté=%d, notre NC visible=%d, fenêtre cachée=%d",
+          when, presented, gVisible, gWindow ? (int)gWindow.hidden : -1);
+    // Si le rideau natif s'est présenté malgré tout, juste après NOTRE interception
+    // et alors que l'appareil est déverrouillé, on le referme sans animation.
+    if (presented && gVisible && NCIsUnlocked()) {
+        SEL sel = NSSelectorFromString(@"setCoverSheetPresented:animated:withCompletion:");
+        if ([pm respondsToSelector:sel]) {
+            NCLOG(@"fermeture forcée du CoverSheet natif (déverrouillé, juste après notre interception)");
+            ((void (*)(id, SEL, BOOL, BOOL, id))objc_msgSend)(pm, sel, NO, NO, nil);
         }
-        NCLOG(@"0.6 s après interception: CoverSheet natif présenté=%d, notre NC visible=%d", presented, gVisible);
-    });
+    }
+}
+
+static void NCReportAfterIntercept(void) {
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{ NCCheckNativeCoverSheet(@"0.4 s"); });
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{ NCCheckNativeCoverSheet(@"1.2 s"); });
 }
 
 static BOOL NCSwallowCoverSheetGesture(id g, UIGestureRecognizerState state) {
     if (state != UIGestureRecognizerStateBegan) return NO;
     if (!NCShouldIntercept()) return NO;
-    NCLOG(@"swipe-down déverrouillé: geste %@ annulé -> NC iOS 9", NSStringFromClass([g class]));
     gLastIntercept = CFAbsoluteTimeGetCurrent();
+    if (gVisible) {
+        NCLOG(@"geste %@ annulé (NC iOS 9 déjà affiché)", NSStringFromClass([g class]));
+        return YES;
+    }
+    NCLOG(@"swipe-down déverrouillé: geste %@ annulé -> NC iOS 9", NSStringFromClass([g class]));
     dispatch_async(dispatch_get_main_queue(), ^{ NCShow(); });
     NCReportAfterIntercept();
     return YES;
@@ -193,9 +209,17 @@ static BOOL NCSwallowCoverSheetGesture(id g, UIGestureRecognizerState state) {
 %hook SBCoverSheetSystemGesturesDelegate
 - (BOOL)gestureRecognizerShouldBegin:(UIGestureRecognizer *)g {
     BOOL r = %orig;
-    BOOL recent = (CFAbsoluteTimeGetCurrent() - gLastIntercept) < 1.0;
-    NCLOG(@"delegate shouldBegin: %@ orig=%d récent=%d", NSStringFromClass([g class]), r, recent);
-    if (recent && r) return NO;
+    if (!r) return r;
+    if (NCShouldIntercept()) {
+        gLastIntercept = CFAbsoluteTimeGetCurrent();
+        NCLOG(@"delegate: geste %@ refusé (déverrouillé, rideau natif non présenté)", NSStringFromClass([g class]));
+        if (!gVisible) {
+            dispatch_async(dispatch_get_main_queue(), ^{ NCShow(); });
+            NCReportAfterIntercept();
+        }
+        return NO;
+    }
+    NCLOG(@"delegate shouldBegin: %@ orig=%d", NSStringFromClass([g class]), r);
     return r;
 }
 %end
@@ -252,7 +276,8 @@ static void NCMarkStable(void) {
 
 static void NCLockEvent(CFNotificationCenterRef c, void *o, CFStringRef n, const void *obj, CFDictionaryRef u) {
     gLastLockEvent = CFAbsoluteTimeGetCurrent();
-    dispatch_async(dispatch_get_main_queue(), ^{ NCHide(NO); });
+    NSString *name = (__bridge NSString *)n;
+    dispatch_async(dispatch_get_main_queue(), ^{ NCHideWhy(NO, [NSString stringWithFormat:@"notification Darwin %@", name]); });
 }
 
 // ---------------------------------------------------------------------------

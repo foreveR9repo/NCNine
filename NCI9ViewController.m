@@ -95,7 +95,7 @@ static NSString *Ago(NSDate *d) {
 @end
 
 @implementation NCI9ViewController {
-    UIVisualEffectView *_blur; UIView *_tintOverlay;
+    UIView *_content; UIVisualEffectView *_blur; UIView *_tintOverlay;
     UIButton *_btnToday, *_btnNotifs; UIView *_selBG, *_segBox, *_rule;
     UIScrollView *_today; UITableView *_table; UILabel *_emptyL;
     UIButton *_handle; NSInteger _tab;
@@ -106,18 +106,33 @@ static NSString *Ago(NSDate *d) {
 - (void)viewDidLoad {
     [super viewDidLoad];
     self.view.backgroundColor = UIColor.clearColor;
+    _content = [[UIView alloc] initWithFrame:self.view.bounds];
+    _content.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    _content.transform = CGAffineTransformMakeTranslation(0, -UIScreen.mainScreen.bounds.size.height); // hors écran, en haut
+    [self.view addSubview:_content];
 
     _blur = [[UIVisualEffectView alloc] initWithEffect:[UIBlurEffect effectWithStyle:UIBlurEffectStyleDark]];
     _blur.frame = self.view.bounds; _blur.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
-    [self.view addSubview:_blur];
+    [_content addSubview:_blur];
     _tintOverlay = [[UIView alloc] initWithFrame:self.view.bounds];
     _tintOverlay.backgroundColor = [UIColor colorWithWhite:0 alpha:.25];
     _tintOverlay.autoresizingMask = _blur.autoresizingMask;
-    [self.view addSubview:_tintOverlay];
+    [_content addSubview:_tintOverlay];
 
     [self buildSegment]; [self buildToday]; [self buildTable]; [self buildHandle];
     [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(reload) name:NCI9StoreDidChange object:nil];
     [self selectTabIndex:0];
+}
+- (void)animateIn {
+    [self.view layoutIfNeeded];
+    [UIView animateWithDuration:.32 delay:0 usingSpringWithDamping:.95 initialSpringVelocity:0 options:0 animations:^{
+        self->_content.transform = CGAffineTransformIdentity;
+    } completion:nil];
+}
+- (void)animateOutWithCompletion:(void (^)(void))c {
+    [UIView animateWithDuration:.28 delay:0 options:UIViewAnimationOptionCurveEaseIn animations:^{
+        self->_content.transform = CGAffineTransformMakeTranslation(0, -self.view.bounds.size.height);
+    } completion:^(BOOL f) { if (c) c(); }];
 }
 - (void)dealloc { [[NSNotificationCenter defaultCenter] removeObserver:self]; }
 - (BOOL)prefersStatusBarHidden { return NO; }
@@ -128,14 +143,14 @@ static NSString *Ago(NSDate *d) {
     _segBox = [UIView new];
     _segBox.layer.cornerRadius = 4; _segBox.layer.borderWidth = 1; _segBox.clipsToBounds = YES;
     _segBox.layer.borderColor = [UIColor colorWithWhite:1 alpha:.4].CGColor;
-    [self.view addSubview:_segBox];
+    [_content addSubview:_segBox];
 
     _selBG = [UIView new]; _selBG.backgroundColor = Tint(); [_segBox addSubview:_selBG];
     _btnToday  = [self segButton:NCI9L(@"today") tag:0];
     _btnNotifs = [self segButton:NCI9L(@"notifs") tag:1];
     _rule = [UIView new];
     _rule.backgroundColor = RuleColor();
-    [self.view addSubview:_rule];
+    [_content addSubview:_rule];
 }
 - (UIButton *)segButton:(NSString *)t tag:(NSInteger)tag {
     UIButton *b = [UIButton buttonWithType:UIButtonTypeCustom]; b.tag = tag;
@@ -162,7 +177,7 @@ static NSString *Ago(NSDate *d) {
 // ---- Today ----
 - (void)buildToday {
     _today = [UIScrollView new]; _today.alwaysBounceVertical = YES;
-    [self.view addSubview:_today];
+    [_content addSubview:_today];
 }
 - (UIView *)sectionBand:(NSString *)name icon:(UIImage *)icon width:(CGFloat)w y:(CGFloat)y {
     UIView *band = [[UIView alloc] initWithFrame:CGRectMake(0, y, w, kSectionH)];
@@ -236,10 +251,10 @@ static NSString *Ago(NSDate *d) {
     _table.rowHeight = UITableViewAutomaticDimension; _table.estimatedRowHeight = 60;
     _table.sectionHeaderHeight = kSectionH;
     [_table registerClass:NCI9NotifCell.class forCellReuseIdentifier:@"c"];
-    [self.view addSubview:_table];
+    [_content addSubview:_table];
     _emptyL = [UILabel new]; _emptyL.text = NCI9L(@"none"); _emptyL.textColor = [UIColor colorWithWhite:1 alpha:.6];
     _emptyL.font = [UIFont systemFontOfSize:20]; _emptyL.textAlignment = NSTextAlignmentCenter;
-    [self.view addSubview:_emptyL];
+    [_content addSubview:_emptyL];
 }
 - (void)reload {
     NSMutableArray *order = [NSMutableArray new]; NSMutableDictionary *g = [NSMutableDictionary new];
@@ -301,7 +316,7 @@ static NSString *Ago(NSDate *d) {
     chev.strokeColor = [UIColor colorWithRed:.45 green:.7 blue:.8 alpha:.85].CGColor;
     chev.frame = CGRectMake(0, 0, 35, 9); chev.name = @"chev";
     [_handle.layer addSublayer:chev];
-    [self.view addSubview:_handle];
+    [_content addSubview:_handle];
 }
 - (void)handleTapped { if (self.requestDismiss) self.requestDismiss(); }
 - (void)handlePan:(UIPanGestureRecognizer *)g {
