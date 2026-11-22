@@ -1,5 +1,6 @@
 #import <UIKit/UIKit.h>
 #import <notify.h>
+#import <objc/runtime.h>
 #import "NCI9Store.h"
 #import "NCI9ViewController.h"
 
@@ -118,7 +119,7 @@ static BOOL NCShouldIntercept(void) {
 static BOOL NCSwallowCoverSheetGesture(id g, UIGestureRecognizerState state) {
     if (state != UIGestureRecognizerStateBegan) return NO;
     if (!NCShouldIntercept()) return NO;
-    NCLOG(@"swipe-down déverrouillé: geste %@ annulé -> NC iOS 9", NSStringFromClass(object_getClass(g)));
+    NCLOG(@"swipe-down déverrouillé: geste %@ annulé -> NC iOS 9", NSStringFromClass([g class]));
     dispatch_async(dispatch_get_main_queue(), ^{ NCShow(); });
     return YES;
 }
